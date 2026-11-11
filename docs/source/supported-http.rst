@@ -39,8 +39,10 @@ special-case logic to care about are: ``Connection:``,
 and ``Expect:`` (which is really from `RFC 7231
 <https://tools.ietf.org/html/rfc7231#section-5.1.1>`_ but
 whatever). The other headers in RFC 7230 are ``TE:``, ``Trailer:``,
-and ``Via:``; h11 also supports these in the sense that it ignores
-them and that's really all it should be doing.
+and ``Via:``; h11 supports ``TE:`` and ``Via:`` in the sense that it
+ignores them and that's really all it should be doing, while
+``Trailer:`` is consulted by the optional :ref:`trailer policy
+<trailers>` when validating chunked trailers.
 
 Transfer-Encoding support: we only know ``chunked``, not ``gzip`` or
 ``deflate``. We're in good company in this: node.js at least doesn't

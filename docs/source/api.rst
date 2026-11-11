@@ -389,6 +389,66 @@ type(event).__name__)``. Not that this kind of dispatch-based strategy
 is always the best approach -- but the option is there if you want it.
 
 
+.. _trailers:
+
+Trailers
+--------
+
+Chunked messages may carry trailing header fields on their
+:class:`EndOfMessage` event. Which of those fields are acceptable is a
+matter of local policy: RFC 7230 `forbids framing, routing and
+authentication fields
+<https://tools.ietf.org/html/rfc7230#section-4.1.2>`_ from appearing in
+trailers, and says a sender must advertise the fields it intends to use
+in the message's ``Trailer:`` header, but applications differ in how
+strictly they want to enforce this.
+
+h11 therefore keeps the rules behind a :class:`TrailerPolicy` object,
+which the same :class:`Connection` applies in both directions:
+
+* When *sending*, a violating :class:`Request`, :class:`Response` or
+  :class:`EndOfMessage` raises :class:`LocalProtocolError` before any
+  bytes are written, so the peer never sees a half-finished message.
+* When *receiving*, a violating :class:`EndOfMessage` raises
+  :class:`RemoteProtocolError` and moves the peer to :data:`ERROR`
+  before the event is delivered, so a bad trailer can never be mistaken
+  for a completed message.
+
+The default policy is fully permissive, so existing code keeps working.
+For spec-strict enforcement, construct your connection with
+:data:`STRICT_TRAILER_POLICY`, or build your own policy from custom
+field sets.
+
+.. ipython:: python
+
+    strict = h11.Connection(h11.CLIENT, trailer_policy=h11.STRICT_TRAILER_POLICY)
+    strict.send(
+        h11.Request(
+            method="POST",
+            target="/",
+            headers=[
+                ("Host", "example.com"),
+                ("Transfer-Encoding", "chunked"),
+                ("Trailer", "X-Checksum"),
+            ],
+        )
+    )
+    strict.send(h11.Data(data=b"hello"))
+    try:
+        # X-Checksum was declared, but an undeclared field is rejected:
+        strict.send(h11.EndOfMessage(headers=[("X-Other", "value")]))
+    except h11.LocalProtocolError as exc:
+        print(exc)
+
+.. autoclass:: TrailerPolicy
+
+.. autodata:: DEFAULT_TRAILER_POLICY
+
+.. autodata:: STRICT_TRAILER_POLICY
+
+.. autodata:: FORBIDDEN_TRAILER_FIELDS
+
+
 The Connection object
 ---------------------
 

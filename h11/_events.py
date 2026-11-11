@@ -307,11 +307,12 @@ class Data(Event):
     __hash__ = None  # type: ignore
 
 
-# XX FIXME: "A recipient MUST ignore (or consider as an error) any fields that
+# Note: "A recipient MUST ignore (or consider as an error) any fields that
 # are forbidden to be sent in a trailer, since processing them as if they were
 # present in the header section might bypass external security filters."
 # https://svn.tools.ietf.org/svn/wg/httpbis/specs/rfc7230.html#chunked.trailer.part
-# Unfortunately, the list of forbidden fields is long and vague :-/
+# Enforcement of this rule (and of Trailer: declarations) is delegated to the
+# configurable TrailerPolicy on Connection; see h11._trailers.
 @dataclass(init=False, frozen=True)
 class EndOfMessage(Event):
     """The end of an HTTP message.
@@ -327,6 +328,10 @@ class EndOfMessage(Event):
        <headers-format>` for details.
 
        Must be empty unless ``Transfer-Encoding: chunked`` is in use.
+
+       Which trailer fields are acceptable is controlled by the
+       :class:`~h11.TrailerPolicy` configured on the
+       :class:`~h11.Connection`; see :ref:`trailers`.
 
     """
 

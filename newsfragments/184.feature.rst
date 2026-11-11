@@ -1,0 +1,9 @@
+Added a pluggable :class:`~h11.TrailerPolicy` for validating chunked
+trailer fields, configurable per :class:`~h11.Connection` via the new
+``trailer_policy`` argument (and enforced on both sending and receiving).
+It can enforce the RFC 7230 forbidden trailer fields, the initial
+``Trailer:`` declaration (including field-name casing, repeated
+declarations and multi-valued trailers), and rejects trailers on
+non-chunked messages. The default policy preserves the previous
+permissive behavior; use :data:`~h11.STRICT_TRAILER_POLICY` for
+spec-strict enforcement.

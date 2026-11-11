@@ -22,7 +22,12 @@ from ._events import (
     Request,
     Response,
 )
-from ._headers import get_comma_header, has_expect_100_continue, set_comma_header
+from ._headers import (
+    Headers,
+    get_comma_header,
+    has_expect_100_continue,
+    set_comma_header,
+)
 from ._readers import READERS, ReadersType
 from ._receivebuffer import ReceiveBuffer
 from ._state import (
@@ -37,6 +42,7 @@ from ._state import (
     SERVER,
     SWITCHED_PROTOCOL,
 )
+from ._trailers import DEFAULT_TRAILER_POLICY, TrailerPolicy, is_chunked
 from ._util import (  # Import the internal things we need
     LocalProtocolError,
     RemoteProtocolError,
@@ -162,14 +168,22 @@ class Connection:
             exceeded, then :meth:`next_event` will raise
             :exc:`RemoteProtocolError`.
 
+        trailer_policy (:class:`~h11.TrailerPolicy`):
+            Policy used to validate trailer fields, in both the sending and
+            receiving directions. Defaults to :data:`~h11.DEFAULT_TRAILER_POLICY`,
+            which accepts anything h11 historically accepted. See
+            :ref:`trailers` for details.
+
     """
 
     def __init__(
         self,
         our_role: Type[Sentinel],
         max_incomplete_event_size: int = DEFAULT_MAX_INCOMPLETE_EVENT_SIZE,
+        trailer_policy: TrailerPolicy = DEFAULT_TRAILER_POLICY,
     ) -> None:
         self._max_incomplete_event_size = max_incomplete_event_size
+        self.trailer_policy = trailer_policy
         # State and role tracking
         if our_role not in (CLIENT, SERVER):
             raise ValueError(f"expected CLIENT or SERVER, not {our_role!r}")
@@ -199,6 +213,15 @@ class Connection:
         # made available as a convenient public API.
         self.their_http_version: Optional[bytes] = None
         self._request_method: Optional[bytes] = None
+        # Whether the message currently being written/read by each side uses
+        # chunked framing; this is the only framing that can carry trailers.
+        # The message headers are kept alongside so the trailer policy can
+        # consult the initial Trailer: declaration. These are set when the
+        # corresponding Request/Response is processed.
+        self._our_chunked = False
+        self._their_chunked = False
+        self._our_message_headers: Optional[Headers] = None
+        self._their_message_headers: Optional[Headers] = None
         # This is pure flow-control and doesn't at all affect the set of legal
         # transitions, so no need to bother ConnectionState with it:
         self.client_is_waiting_for_100_continue = False
@@ -247,6 +270,10 @@ class Connection:
         old_states = dict(self._cstate.states)
         self._cstate.start_next_cycle()
         self._request_method = None
+        self._our_chunked = False
+        self._their_chunked = False
+        self._our_message_headers = None
+        self._their_message_headers = None
         # self.their_http_version gets left alone, since it presumably lasts
         # beyond a single request/response cycle
         assert not self.client_is_waiting_for_100_continue
@@ -287,6 +314,17 @@ class Connection:
 
         if type(event) is Request:
             self._request_method = event.method
+
+        # Remember whether this message can carry trailers. Informational
+        # responses have no body, so they don't affect this.
+        if type(event) in (Request, Response):
+            framing_event = cast(Union[Request, Response], event)
+            if role is self.our_role:
+                self._our_chunked = is_chunked(framing_event.headers)
+                self._our_message_headers = framing_event.headers
+            else:
+                self._their_chunked = is_chunked(framing_event.headers)
+                self._their_message_headers = framing_event.headers
 
         if role is self.their_role and type(event) in (
             Request,
@@ -349,6 +387,24 @@ class Connection:
             self._writer = self._get_io_object(self.our_role, event, WRITERS)
         if self.their_state != old_states[self.their_role]:
             self._reader = self._get_io_object(self.their_role, event, READERS)
+
+    def _check_outgoing_trailers(self, event: EndOfMessage) -> None:
+        if not event.headers:
+            return
+        self.trailer_policy.check(
+            event.headers,
+            self._our_message_headers or Headers([]),
+            self._our_chunked,
+        )
+
+    def _check_incoming_trailers(self, event: EndOfMessage) -> None:
+        if not event.headers:
+            return
+        self.trailer_policy.check(
+            event.headers,
+            self._their_message_headers or Headers([]),
+            self._their_chunked,
+        )
 
     @property
     def trailing_data(self) -> Tuple[bytes, bool]:
@@ -480,6 +536,11 @@ class Connection:
         try:
             event = self._extract_next_receive_event()
             if event not in [NEED_DATA, PAUSED]:
+                # Validate before the state machine accepts the ending, so a
+                # policy violation puts us in ERROR and surfaces as a protocol
+                # error instead of being hidden behind a completed message.
+                if type(event) is EndOfMessage:
+                    self._check_incoming_trailers(cast(EndOfMessage, event))
                 self._process_event(self.their_role, cast(Event, event))
             if event is NEED_DATA:
                 if len(self._receive_buffer) > self._max_incomplete_event_size:
@@ -554,6 +615,16 @@ class Connection:
         try:
             if type(event) is Response:
                 event = self._clean_up_response_headers_for_sending(event)
+            # Trailer policy checks run before the state machine transition
+            # and before the writer produces any bytes, so a rejected
+            # EndOfMessage can never leave a half-written message on the
+            # wire -- the peer never sees an apparently successful ending.
+            if type(event) in (Request, Response):
+                self.trailer_policy.check_declarations(
+                    cast(Union[Request, Response], event).headers
+                )
+            elif type(event) is EndOfMessage:
+                self._check_outgoing_trailers(cast(EndOfMessage, event))
             # We want to call _process_event before calling the writer,
             # because if someone tries to do something invalid then this will
             # give a sensible error message, while our writers all just assume
