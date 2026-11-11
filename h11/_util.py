@@ -6,6 +6,9 @@ __all__ = [
     "RemoteProtocolError",
     "validate",
     "bytesify",
+    "LENIENT",
+    "STRICT",
+    "LineEndingPolicy",
 ]
 
 
@@ -119,6 +122,38 @@ class Sentinel(type):
 
     def __repr__(self) -> str:
         return self.__name__
+
+
+# Line-ending policies for parsing received data (see
+# Connection(line_ending_policy=...)).
+#
+# RFC 9112 section 3 says that a recipient MAY recognize a single LF as a
+# line terminator (and ignore any preceding CR), even though senders must
+# always use CRLF. LENIENT implements that historical behavior; STRICT
+# refuses anything but CRLF, which is useful when talking to peers whose
+# leniency differs from ours (e.g. to avoid request-smuggling
+# discrepancies).
+class LENIENT(Sentinel, metaclass=Sentinel):
+    """Line-ending policy: accept both CRLF and bare LF as line terminators
+    in received start-lines, header lines, chunk framing, and trailers.
+
+    This is the default, and matches the behavior of older h11 releases.
+    """
+
+
+class STRICT(Sentinel, metaclass=Sentinel):
+    """Line-ending policy: require CRLF as the line terminator in received
+    start-lines, header lines, chunk framing, and trailers.
+
+    A bare LF in any of these positions triggers a
+    :exc:`RemoteProtocolError`; other malformed framing is rejected as
+    usual. Message bodies are opaque bytes and are not affected by this
+    policy.
+    """
+
+
+# The type of the LENIENT/STRICT constants, for use in annotations.
+LineEndingPolicy = Union[Type[LENIENT], Type[STRICT]]
 
 
 # Used for methods, request targets, HTTP versions, header names, and header

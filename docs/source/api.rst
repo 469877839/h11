@@ -444,6 +444,54 @@ The Connection object
       :attr:`client_is_waiting_for_100_continue`.
 
    .. autoattribute:: trailing_data
+   .. autoattribute:: line_ending_policy
+
+Line-ending policies
+~~~~~~~~~~~~~~~~~~~~
+
+HTTP/1.1 wire messages terminate their start line, header lines, chunk
+size/terminator lines, and trailers with the two-byte sequence
+``CRLF``. In practice, however, many implementations emit a bare
+``LF`` instead, and RFC 9112 section 3 explicitly permits recipients to
+accept these. h11 exposes this choice through the
+``line_ending_policy`` argument to :class:`Connection`:
+
+.. data:: LENIENT
+
+   Accept both ``CRLF`` and bare ``LF`` as line terminators in
+   received framing. This is the default, and preserves the behavior
+   of older h11 releases.
+
+.. data:: STRICT
+
+   Require ``CRLF`` everywhere the protocol uses line terminators:
+   the request/status line, header lines, chunk sizes, chunk
+   terminators, and trailers. A bare ``LF`` in any of these positions
+   causes :meth:`Connection.next_event` to raise
+   :exc:`RemoteProtocolError`, after which the peer is in the
+   :data:`ERROR` state and the connection cannot be recycled.
+
+Message bodies are opaque byte sequences and are never affected by
+this policy -- a bare ``LF`` inside a Content-Length or chunk body is
+valid data in both modes. The policy only governs how data *received*
+from the peer is parsed; h11 always sends ``CRLF`` itself.
+
+For example, if a front-end proxy and an upstream gateway disagree
+about whether bare ``LF`` is acceptable, configuring both to use
+:data:`h11.STRICT` makes them reject the same inputs and removes the
+discrepancy that can enable request smuggling.
+
+.. ipython:: python
+
+   import h11
+
+   strict = h11.Connection(h11.SERVER, line_ending_policy=h11.STRICT)
+   strict.receive_data(b"GET / HTTP/1.1\nHost: example.com\n\n")
+   try:
+       strict.next_event()
+   except h11.RemoteProtocolError as error:
+       print(error)
+   strict.their_state is h11.ERROR
 
 
 .. _error-handling:

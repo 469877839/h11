@@ -2,6 +2,8 @@ import re
 import sys
 from typing import List, Optional, Union
 
+from ._util import LENIENT, LineEndingPolicy, LocalProtocolError, STRICT
+
 __all__ = ["ReceiveBuffer"]
 
 
@@ -45,10 +47,32 @@ blank_line_regex = re.compile(b"\n\r?\n", re.MULTILINE)
 
 
 class ReceiveBuffer:
-    def __init__(self) -> None:
+    def __init__(self, line_ending_policy: LineEndingPolicy = LENIENT) -> None:
+        if line_ending_policy is not LENIENT and line_ending_policy is not STRICT:
+            raise ValueError(
+                "line_ending_policy must be h11.LENIENT or h11.STRICT, "
+                f"not {line_ending_policy!r}"
+            )
+        self._line_ending_policy = line_ending_policy
         self._data = bytearray()
         self._next_line_search = 0
         self._multiple_lines_search = 0
+
+    # In STRICT mode every framing line has to end with CRLF. We only look at
+    # bytes up through a complete LF-terminated line, so a CR left at the end
+    # of a receive_data() chunk (waiting for its LF in a later call) is never
+    # rejected prematurely. Message-body bytes never pass through here, so a
+    # bare LF inside e.g. a Content-Length body is not affected.
+    def _reject_bare_line_feed(self, data: Union[bytes, bytearray]) -> None:
+        if self._line_ending_policy is not STRICT:
+            return
+        if b"\n" not in data:
+            return
+        for idx in range(len(data)):
+            if data[idx] == 0x0A and (idx == 0 or data[idx - 1] != 0x0D):
+                raise LocalProtocolError(
+                    "bare LF in line terminator (strict CRLF policy)"
+                )
 
     def __iadd__(self, byteslike: Union[bytes, bytearray]) -> "ReceiveBuffer":
         self._data += byteslike
@@ -82,6 +106,10 @@ class ReceiveBuffer:
         if not out:
             return None
 
+        # Note: framing structure (start line, headers, chunk lines) is
+        # validated by the callers that use maybe_extract_next_line /
+        # maybe_extract_lines; this method is also used to pull opaque
+        # message-body bytes, which are not subject to line-ending rules.
         return self._extract(count)
 
     def maybe_extract_next_line(self) -> Optional[bytearray]:
@@ -99,6 +127,7 @@ class ReceiveBuffer:
         # + 2 is to compensate len(b"\r\n")
         idx = partial_idx + 2
 
+        self._reject_bare_line_feed(self._data[:idx])
         return self._extract(idx)
 
     def maybe_extract_lines(self) -> Optional[List[bytearray]]:
@@ -107,6 +136,8 @@ class ReceiveBuffer:
         """
         # Handle the case where we have an immediate empty line.
         if self._data[:1] == b"\n":
+            if self._line_ending_policy is STRICT:
+                self._reject_bare_line_feed(self._data[:1])
             self._extract(1)
             return []
 
@@ -122,6 +153,7 @@ class ReceiveBuffer:
 
         # Truncate the buffer and return it.
         idx = match.span(0)[-1]
+        self._reject_bare_line_feed(self._data[:idx])
         out = self._extract(idx)
         lines = out.split(b"\n")
 

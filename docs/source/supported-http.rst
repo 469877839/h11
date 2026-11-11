@@ -74,3 +74,15 @@ sure whether anyone actually needs it. Unfortunately a few major
 implementations that I spot-checked (node.js, go) do still seem to
 support reading such headers (but not generating them), so it might or
 might not be obsolete in practice -- it's hard to know.
+
+Line terminators: the standard says framing lines (start line,
+headers, chunk size/terminator lines, trailers) end with ``CRLF``,
+but `RFC 9112 section 3
+<https://www.rfc-editor.org/rfc/rfc9112#section-3>`_ allows a
+recipient to accept a bare ``LF`` instead. By default h11 does accept
+both (:data:`h11.LENIENT`); if you want strict standards-compliant
+behavior -- for example so that h11 rejects exactly the same messages
+as a strict peer and avoids parser-discrepancy issues -- construct the
+:class:`Connection` with ``line_ending_policy=h11.STRICT``. This never
+affects message bodies or the bytes h11 itself generates, which
+always use ``CRLF``.

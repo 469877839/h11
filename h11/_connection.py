@@ -38,6 +38,8 @@ from ._state import (
     SWITCHED_PROTOCOL,
 )
 from ._util import (  # Import the internal things we need
+    LENIENT,
+    LineEndingPolicy,
     LocalProtocolError,
     RemoteProtocolError,
     Sentinel,
@@ -162,14 +164,27 @@ class Connection:
             exceeded, then :meth:`next_event` will raise
             :exc:`RemoteProtocolError`.
 
+        line_ending_policy:
+            Which line terminators to accept when parsing data received
+            from the peer. :data:`h11.LENIENT` (the default) accepts both
+            CRLF and bare LF, matching historical h11 behavior.
+            :data:`h11.STRICT` requires CRLF everywhere the protocol uses
+            line terminators: the request/status line, header lines, chunk
+            sizes, chunk terminators, and trailers. Message bodies are
+            opaque bytes and are never affected by this policy. This only
+            changes how received data is parsed; data we send always uses
+            CRLF regardless.
+
     """
 
     def __init__(
         self,
         our_role: Type[Sentinel],
         max_incomplete_event_size: int = DEFAULT_MAX_INCOMPLETE_EVENT_SIZE,
+        line_ending_policy: LineEndingPolicy = LENIENT,
     ) -> None:
         self._max_incomplete_event_size = max_incomplete_event_size
+        self._line_ending_policy = line_ending_policy
         # State and role tracking
         if our_role not in (CLIENT, SERVER):
             raise ValueError(f"expected CLIENT or SERVER, not {our_role!r}")
@@ -187,7 +202,7 @@ class Connection:
         self._reader = self._get_io_object(self.their_role, None, READERS)
 
         # Holds any unprocessed received data
-        self._receive_buffer = ReceiveBuffer()
+        self._receive_buffer = ReceiveBuffer(self._line_ending_policy)
         # If this is true, then it indicates that the incoming connection was
         # closed *after* the end of whatever's in self._receive_buffer:
         self._receive_buffer_closed = False
@@ -227,6 +242,13 @@ class Connection:
         :ref:`state-machine` for details.
         """
         return self._cstate.states[self.their_role]
+
+    @property
+    def line_ending_policy(self) -> LineEndingPolicy:
+        """The line-ending policy used when parsing received data: either
+        :data:`h11.LENIENT` (the default) or :data:`h11.STRICT`.
+        """
+        return self._line_ending_policy
 
     @property
     def they_are_waiting_for_100_continue(self) -> bool:

@@ -23,7 +23,14 @@ from .._state import (
     SERVER,
     SWITCHED_PROTOCOL,
 )
-from .._util import LocalProtocolError, RemoteProtocolError, Sentinel
+from .._util import (
+    LENIENT,
+    LineEndingPolicy,
+    LocalProtocolError,
+    RemoteProtocolError,
+    Sentinel,
+    STRICT,
+)
 from .helpers import ConnectionPair, get_all_events, receive_and_get
 
 
@@ -1118,3 +1125,364 @@ def test_special_exceptions_for_lost_connection_in_message_body() -> None:
     with pytest.raises(RemoteProtocolError) as excinfo:
         c.next_event()
     assert "incomplete chunked read" in str(excinfo.value)
+
+
+################################################################
+# Line-ending policies
+################################################################
+
+# Each entry is (id, wire bytes). The CRLF variant establishes the expected
+# event sequence; the others differ only in line terminators.
+LINE_ENDING_MESSAGES = {
+    "crlf_request": (b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n"),
+    "lf_request_line": (b"GET / HTTP/1.1\nHost: a\r\nConnection: close\r\n\r\n"),
+    "lf_header": (b"GET / HTTP/1.1\r\nHost: a\nConnection: close\r\n\r\n"),
+    "lf_last_header": (b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\n\r\n"),
+    "lf_blank_line": (b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\n"),
+    "all_lf": (b"GET / HTTP/1.1\nHost: a\nConnection: close\n\n"),
+}
+
+GOOD_CRLF_REQUEST = LINE_ENDING_MESSAGES["crlf_request"]
+
+LINE_ENDING_POLICIES: Tuple[LineEndingPolicy, LineEndingPolicy] = (LENIENT, STRICT)
+
+
+def _consume_all(c: Connection) -> List[Any]:
+    """Return every event until next_event() needs more data, letting any
+    protocol error propagate to the caller.
+    """
+    events: List[Any] = []
+    while True:
+        event = c.next_event()
+        if event is NEED_DATA or event is PAUSED:
+            return events
+        events.append(event)
+        if type(event) is ConnectionClosed:
+            return events
+
+
+def _feed_in_two_parts(c: Connection, data: bytes, cut: int) -> None:
+    """Feed *data* split at *cut* bytes. Empty halves are skipped because
+    receive_data(b"") means EOF.
+    """
+    if cut > 0:
+        c.receive_data(data[:cut])
+    if cut < len(data):
+        c.receive_data(data[cut:])
+
+
+def _result_at_cut(data: bytes, policy: Any, cut: int) -> Any:
+    c = Connection(SERVER, line_ending_policy=policy)
+    _feed_in_two_parts(c, data, cut)
+    try:
+        return _consume_all(c)
+    except RemoteProtocolError as exc:
+        return exc
+
+
+def test_line_ending_policy_defaults_to_lenient() -> None:
+    c = Connection(SERVER)
+    assert c.line_ending_policy is LENIENT
+    assert Connection(SERVER, line_ending_policy=LENIENT).line_ending_policy is LENIENT
+    assert Connection(SERVER, line_ending_policy=STRICT).line_ending_policy is STRICT
+
+
+def test_invalid_line_ending_policy_rejected() -> None:
+    with pytest.raises(ValueError):
+        Connection(SERVER, line_ending_policy="lenient")  # type: ignore[arg-type]
+
+
+def test_lenient_still_accepts_bare_lf() -> None:
+    # Backwards compatibility: the default policy is unchanged, and every
+    # bare-LF variant parses to exactly the same events as all-CRLF input.
+    expected = receive_and_get(Connection(SERVER), GOOD_CRLF_REQUEST)
+    assert len(expected) == 2
+    for name, data in LINE_ENDING_MESSAGES.items():
+        got = receive_and_get(Connection(SERVER, line_ending_policy=LENIENT), data)
+        assert got == expected, name
+
+
+def test_strict_accepts_crlf() -> None:
+    c = Connection(SERVER, line_ending_policy=STRICT)
+    c.receive_data(GOOD_CRLF_REQUEST)
+    assert _consume_all(c) == [
+        Request(
+            method="GET",
+            target="/",
+            headers=[("Host", "a"), ("Connection", "close")],
+        ),
+        EndOfMessage(),
+    ]
+
+
+@pytest.mark.parametrize(
+    "name",
+    [name for name in LINE_ENDING_MESSAGES if name != "crlf_request"],
+)
+def test_strict_rejects_bare_lf(name: str) -> None:
+    c = Connection(SERVER, line_ending_policy=STRICT)
+    c.receive_data(LINE_ENDING_MESSAGES[name])
+    with pytest.raises(RemoteProtocolError):
+        c.next_event()
+
+    # A rejected message must not leave a half-open cycle that can be
+    # recycled: the peer side is ERROR, so it can't be reused.
+    assert c.their_state is ERROR
+    with pytest.raises(LocalProtocolError):
+        c.start_next_cycle()
+    # And further reads keep failing rather than resuming a half-message.
+    with pytest.raises(RemoteProtocolError):
+        c.next_event()
+
+
+def test_strict_rejects_bare_lf_in_response() -> None:
+    # The policy applies symmetrically to a client parsing responses.
+    c = Connection(CLIENT, line_ending_policy=STRICT)
+    c.send(Request(method="GET", target="/", headers=[("Host", "a")]))
+    c.receive_data(b"HTTP/1.1 200 OK\nContent-Length: 0\n\n")
+    with pytest.raises(RemoteProtocolError):
+        c.next_event()
+    assert c.their_state is ERROR
+
+    # Same bytes with CRLF parse fine.
+    c = Connection(CLIENT, line_ending_policy=STRICT)
+    c.send(Request(method="GET", target="/", headers=[("Host", "a")]))
+    c.receive_data(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+    assert _consume_all(c) == [
+        Response(status_code=200, headers=[("Content-Length", "0")], reason=b"OK"),
+        EndOfMessage(),
+    ]
+
+
+@pytest.mark.parametrize("name", list(LINE_ENDING_MESSAGES))
+def test_line_ending_result_is_stable_at_every_split(name: str) -> None:
+    """Feeding the same short message with every possible single cut point
+    must not change the outcome: LENIENT always yields the CRLF event
+    sequence; STRICT yields it only for CRLF input and a protocol error
+    otherwise.
+    """
+    data = LINE_ENDING_MESSAGES[name]
+    lenient_expected = _result_at_cut(data, LENIENT, 0)
+    assert lenient_expected == receive_and_get(Connection(SERVER), GOOD_CRLF_REQUEST)
+    is_crlf = name == "crlf_request"
+    strict_expected = _result_at_cut(data, STRICT, 0)
+
+    for cut in range(len(data) + 1):
+        lenient_result = _result_at_cut(data, LENIENT, cut)
+        assert lenient_result == lenient_expected, (name, cut)
+
+        strict_result = _result_at_cut(data, STRICT, cut)
+        assert type(strict_result) is type(strict_expected), (name, cut)
+        if isinstance(strict_result, RemoteProtocolError):
+            assert strict_result.error_status_hint == 400
+        else:
+            assert strict_result == strict_expected, (name, cut)
+            assert is_crlf, (name, cut)
+
+
+def test_strict_crlf_survives_byte_at_a_time_feeding() -> None:
+    # A CR at the end of one receive_data() call is completed by the LF in
+    # the next; the strict check must look at complete lines only.
+    c = Connection(SERVER, line_ending_policy=STRICT)
+    events: List[Any] = []
+    for byte in GOOD_CRLF_REQUEST:
+        c.receive_data(bytes([byte]))
+        events += _consume_all(c)
+    assert events == [
+        Request(
+            method="GET",
+            target="/",
+            headers=[("Host", "a"), ("Connection", "close")],
+        ),
+        EndOfMessage(),
+    ]
+
+
+# Chunked framing: chunk size lines, chunk terminators, and trailers all go
+# through the same policy.
+CHUNKED_MESSAGES = {
+    "crlf": (
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n"
+        b"Connection: close\r\n\r\n"
+        b"5\r\nhello\r\n0\r\nX-T: v\r\n\r\n"
+    ),
+    "lf_chunk_size": (
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n"
+        b"Connection: close\r\n\r\n"
+        b"5\nhello\r\n0\r\n\r\n"
+    ),
+    "lf_chunk_footer": (
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n"
+        b"Connection: close\r\n\r\n"
+        b"5\r\nhello\n0\r\n\r\n"
+    ),
+    "lf_trailer": (
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n"
+        b"Connection: close\r\n\r\n"
+        b"5\r\nhello\r\n0\r\nX-T: v\n\r\n"
+    ),
+    "lf_zero_chunk": (
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n"
+        b"Connection: close\r\n\r\n"
+        b"0\n\r\n"
+    ),
+}
+
+
+def test_chunked_crlf_events_for_reference() -> None:
+    c = Connection(SERVER)
+    c.receive_data(CHUNKED_MESSAGES["crlf"])
+    assert _consume_all(c) == [
+        Request(
+            method="POST",
+            target="/",
+            headers=[
+                ("Host", "a"),
+                ("Transfer-Encoding", "chunked"),
+                ("Connection", "close"),
+            ],
+        ),
+        Data(data=b"hello", chunk_start=True, chunk_end=True),
+        EndOfMessage(headers=[("X-T", "v")]),
+    ]
+
+
+@pytest.mark.parametrize("name", [name for name in CHUNKED_MESSAGES if name != "crlf"])
+def test_chunked_bare_lf_rejected_by_strict(name: str) -> None:
+    c = Connection(SERVER, line_ending_policy=STRICT)
+    c.receive_data(CHUNKED_MESSAGES[name])
+    with pytest.raises(RemoteProtocolError):
+        for _ in range(10):
+            c.next_event()
+    assert c.their_state is ERROR
+    with pytest.raises(LocalProtocolError):
+        c.start_next_cycle()
+
+
+# For each chunked message, whether each policy accepts it (events) or
+# rejects it (RemoteProtocolError). LENIENT has always required CRLF for
+# chunk size/terminator framing, but does accept bare LF in trailers.
+CHUNKED_EXPECTATIONS = {
+    "crlf": {LENIENT: "events", STRICT: "events"},
+    "lf_chunk_size": {LENIENT: "error", STRICT: "error"},
+    "lf_chunk_footer": {LENIENT: "error", STRICT: "error"},
+    "lf_trailer": {LENIENT: "events", STRICT: "error"},
+    "lf_zero_chunk": {LENIENT: "error", STRICT: "error"},
+}
+
+
+@pytest.mark.parametrize("name", list(CHUNKED_MESSAGES))
+def test_chunked_outcome_is_stable_at_every_split(name: str) -> None:
+    # Same matrix as the start-line/header messages: splitting the
+    # payload at every single byte boundary must not change whether a
+    # given policy accepts it or rejects it.
+    data = CHUNKED_MESSAGES[name]
+    reference = _result_at_cut(data, LENIENT, 0)
+    for policy in LINE_ENDING_POLICIES:
+        expected_kind = CHUNKED_EXPECTATIONS[name][policy]
+        for cut in range(len(data) + 1):
+            result = _result_at_cut(data, policy, cut)
+            if expected_kind == "error":
+                assert isinstance(result, RemoteProtocolError), (policy, name, cut)
+                assert result.error_status_hint == 400
+            else:
+                assert result == reference, (policy, name, cut)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["lf_chunk_size", "lf_chunk_footer", "lf_zero_chunk"],
+)
+def test_lenient_chunk_framing_was_already_rejected(name: str) -> None:
+    # h11 has historically required CRLF for chunk framing even in lenient
+    # mode (the chunk ABNF demands it), so these stay errors either way.
+    c = Connection(SERVER, line_ending_policy=LENIENT)
+    c.receive_data(CHUNKED_MESSAGES[name])
+    with pytest.raises(RemoteProtocolError):
+        for _ in range(10):
+            c.next_event()
+
+
+def test_lenient_allows_bare_lf_trailer() -> None:
+    # ...but a bare LF in a trailer block is accepted by LENIENT, because
+    # trailers are parsed as ordinary header lines.
+    c = Connection(SERVER, line_ending_policy=LENIENT)
+    c.receive_data(CHUNKED_MESSAGES["lf_trailer"])
+    events = _consume_all(c)
+    assert events[-1] == EndOfMessage(headers=[("X-T", "v")])
+
+
+@pytest.mark.parametrize(
+    "data,body",
+    [
+        (
+            b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nx\nyz\n",
+            b"x\nyz\n",
+        ),
+        (
+            b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\n\r\n\r\n\n",
+            b"\r\n\n",
+        ),
+        (
+            b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\n\r\n\r\nx",
+            b"\r\n\r\nx",
+        ),
+    ],
+)
+def test_strict_never_applies_to_content_length_body(data: bytes, body: bytes) -> None:
+    # Message bodies are opaque: bare LF (and bare CR) inside a
+    # Content-Length body must not be mistaken for bad framing.
+    for policy in LINE_ENDING_POLICIES:
+        c = Connection(SERVER, line_ending_policy=policy)
+        c.receive_data(data)
+        events = _consume_all(c)
+        assert type(events[0]) is Request
+        assert events[1] == Data(data=body)
+        assert events[2] == EndOfMessage()
+        assert len(events) == 3
+
+
+def test_strict_never_applies_to_chunk_body() -> None:
+    # Same for the payload bytes inside a chunk.
+    body = b"a\nb\r\nc\rd"
+    data = (
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n"
+        b"Connection: close\r\n\r\n"
+        + str(len(body)).encode()
+        + b"\r\n"
+        + body
+        + b"\r\n0\r\n\r\n"
+    )
+    for policy in LINE_ENDING_POLICIES:
+        c = Connection(SERVER, line_ending_policy=policy)
+        c.receive_data(data)
+        events = _consume_all(c)
+        assert events[1] == Data(data=body, chunk_start=True, chunk_end=True)
+
+
+def test_sending_is_unaffected_by_strict_policy() -> None:
+    # The policy only governs parsing; our own output is always CRLF and
+    # identical to what a LENIENT connection would produce.
+    def client_request_bytes(policy: Any) -> bytes:
+        client = Connection(CLIENT, line_ending_policy=policy)
+        out = client.send(Request(method="GET", target="/", headers=[("Host", "a")]))
+        assert out is not None
+        return out
+
+    def server_response_bytes(policy: Any) -> bytes:
+        server = Connection(SERVER, line_ending_policy=policy)
+        server.receive_data(GOOD_CRLF_REQUEST)
+        _consume_all(server)
+        out = server.send(Response(status_code=200, headers=[]))
+        assert out is not None
+        return out
+
+    strict_request = client_request_bytes(STRICT)
+    assert strict_request == client_request_bytes(LENIENT)
+    assert strict_request == b"GET / HTTP/1.1\r\nHost: a\r\n\r\n"
+    assert b"\n" not in strict_request.replace(b"\r\n", b"")
+
+    strict_response = server_response_bytes(STRICT)
+    assert strict_response == server_response_bytes(LENIENT)
+    assert strict_response.startswith(b"HTTP/1.1 200 \r\n")
+    assert b"\n" not in strict_response.replace(b"\r\n", b"")
