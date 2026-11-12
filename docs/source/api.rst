@@ -402,6 +402,9 @@ The Connection object
 
    .. automethod:: start_next_cycle
 
+   .. automethod:: checkpoint
+   .. automethod:: from_checkpoint
+
    .. attribute:: our_role
 
       :data:`CLIENT` if this is a client; :data:`SERVER` if this is a server.
@@ -444,6 +447,24 @@ The Connection object
       :attr:`client_is_waiting_for_100_continue`.
 
    .. autoattribute:: trailing_data
+
+
+Offline replay checkpoints
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A checkpoint captures the full state needed to continue parsing a
+recorded, immutable byte stream without replaying its first bytes. It is
+an offline tool: h11 never owns a socket, and a restored connection does
+not reattach to a live one.
+
+The on-disk format is versioned, contains only plain integers, booleans,
+ASCII names and bytes, and carries a checksum. It does not use ``pickle``
+and cannot reconstruct arbitrary Python objects. Corrupt or unsupported
+data is rejected before any connection is created.
+
+.. autofunction:: export_checkpoint
+.. autofunction:: restore_checkpoint
+.. autoexception:: CheckpointError
 
 
 .. _error-handling:

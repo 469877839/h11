@@ -13,6 +13,7 @@ from typing import (
     Union,
 )
 
+from ._checkpoint import export_checkpoint, restore_checkpoint
 from ._events import (
     ConnectionClosed,
     Data,
@@ -360,6 +361,41 @@ class Connection:
         See :ref:`switching-protocols` for discussion of why you'd want this.
         """
         return (bytes(self._receive_buffer), self._receive_buffer_closed)
+
+    def checkpoint(self) -> bytes:
+        """Export a versioned, pickle-free checkpoint of this connection.
+
+        The checkpoint captures everything needed to continue an offline
+        replay of the same immutable byte stream: any unparsed input and its
+        EOF marker, both roles, the full state machine, pending protocol
+        switch proposals, and the progress of the current message's framing
+        (including remaining chunk counts).
+
+        It contains plain bytes and integers only; no sockets or arbitrary
+        Python objects are serialized. Taking a checkpoint does not modify the
+        connection and a default connection keeps no extra state for
+        persistence. Use :meth:`from_checkpoint` to restore the result.
+        """
+        return export_checkpoint(self)
+
+    export_checkpoint = checkpoint
+
+    @classmethod
+    def from_checkpoint(cls, checkpoint: bytes) -> "Connection":
+        """Restore a connection previously saved with :meth:`checkpoint`.
+
+        The checkpoint is validated (including its version and checksum)
+        before any connection is constructed, so corrupt or unsupported data
+        raises :class:`h11.CheckpointError` instead of producing a
+        half-restored object. The returned connection is an independent
+        offline object suitable for continuing a captured-stream replay; it
+        does not reattach to any live socket.
+        """
+        return restore_checkpoint(  # type: ignore[no-any-return]
+            checkpoint, connection_class=cls
+        )
+
+    restore_checkpoint = from_checkpoint
 
     def receive_data(self, data: bytes) -> None:
         """Add data to our internal receive buffer.
