@@ -37,6 +37,7 @@ from ._state import (
     SERVER,
     SWITCHED_PROTOCOL,
 )
+from ._trailers import TrailerPolicy
 from ._util import (  # Import the internal things we need
     LocalProtocolError,
     RemoteProtocolError,
@@ -162,14 +163,26 @@ class Connection:
             exceeded, then :meth:`next_event` will raise
             :exc:`RemoteProtocolError`.
 
+        trailer_policy (:class:`h11.TrailerPolicy`):
+            An optional policy for validating trailer sections, enforced in
+            both directions. When sending, an :class:`EndOfMessage` whose
+            trailers violate the policy raises :exc:`LocalProtocolError`
+            before any bytes are produced. When receiving, a violating
+            trailer section raises :exc:`RemoteProtocolError` instead of
+            returning the :class:`EndOfMessage` event. If not given, trailers
+            are not validated beyond h11's historical behavior.
+
     """
 
     def __init__(
         self,
         our_role: Type[Sentinel],
         max_incomplete_event_size: int = DEFAULT_MAX_INCOMPLETE_EVENT_SIZE,
+        *,
+        trailer_policy: Optional[TrailerPolicy] = None,
     ) -> None:
         self._max_incomplete_event_size = max_incomplete_event_size
+        self._trailer_policy = trailer_policy
         # State and role tracking
         if our_role not in (CLIENT, SERVER):
             raise ValueError(f"expected CLIENT or SERVER, not {our_role!r}")
@@ -199,6 +212,12 @@ class Connection:
         # made available as a convenient public API.
         self.their_http_version: Optional[bytes] = None
         self._request_method: Optional[bytes] = None
+        # Per-role trailer context for the in-progress message, used to
+        # enforce self._trailer_policy: (names declared via the Trailer:
+        # header, whether the body framing is chunked). None when no
+        # body-bearing message is in progress.
+        self._our_trailer_context: Optional[Tuple[List[bytes], bool]] = None
+        self._their_trailer_context: Optional[Tuple[List[bytes], bool]] = None
         # This is pure flow-control and doesn't at all affect the set of legal
         # transitions, so no need to bother ConnectionState with it:
         self.client_is_waiting_for_100_continue = False
@@ -247,6 +266,8 @@ class Connection:
         old_states = dict(self._cstate.states)
         self._cstate.start_next_cycle()
         self._request_method = None
+        self._our_trailer_context = None
+        self._their_trailer_context = None
         # self.their_http_version gets left alone, since it presumably lasts
         # beyond a single request/response cycle
         assert not self.client_is_waiting_for_100_continue
@@ -287,6 +308,25 @@ class Connection:
 
         if type(event) is Request:
             self._request_method = event.method
+
+        if type(event) in (Request, Response):
+            # Remember how this message's body is framed and which trailer
+            # fields it announced, so we can validate its EndOfMessage
+            # trailers against self._trailer_policy. (For Responses we send
+            # ourselves, this runs after _clean_up_response_headers_for_sending,
+            # so it sees the final framing headers.)
+            framing_event = cast(Union[Request, Response], event)
+            framing_type, _ = _body_framing(
+                cast(bytes, self._request_method), framing_event
+            )
+            trailer_context = (
+                get_comma_header(framing_event.headers, b"trailer"),
+                framing_type == "chunked",
+            )
+            if role is self.our_role:
+                self._our_trailer_context = trailer_context
+            else:
+                self._their_trailer_context = trailer_context
 
         if role is self.their_role and type(event) in (
             Request,
@@ -480,6 +520,7 @@ class Connection:
         try:
             event = self._extract_next_receive_event()
             if event not in [NEED_DATA, PAUSED]:
+                self._validate_received_trailers(cast(Event, event))
                 self._process_event(self.their_role, cast(Event, event))
             if event is NEED_DATA:
                 if len(self._receive_buffer) > self._max_incomplete_event_size:
@@ -541,6 +582,37 @@ class Connection:
         else:
             return b"".join(data_list)
 
+    def _validate_received_trailers(self, event: Event) -> None:
+        # Enforce self._trailer_policy (if any) on an incoming EndOfMessage
+        # *before* the state machine processes it: if validation fails we
+        # raise, next_event() converts the error to RemoteProtocolError, and
+        # the peer's state becomes ERROR -- the application never sees an
+        # EndOfMessage that appeared to terminate the message successfully.
+        if self._trailer_policy is None or type(event) is not EndOfMessage:
+            return
+        event = cast(EndOfMessage, event)
+        declared_fields, is_chunked = self._their_trailer_context or ([], False)
+        self._trailer_policy.validate(
+            declared_fields=declared_fields,
+            headers=event.headers,
+            is_chunked=is_chunked,
+        )
+
+    def _validate_outgoing_trailers(self, event: Event) -> None:
+        # Enforce self._trailer_policy (if any) on an outgoing EndOfMessage
+        # *before* any bytes are generated: if validation fails we raise
+        # LocalProtocolError and nothing is sent, so the peer never sees a
+        # message that appeared to end successfully.
+        if self._trailer_policy is None or type(event) is not EndOfMessage:
+            return
+        event = cast(EndOfMessage, event)
+        declared_fields, is_chunked = self._our_trailer_context or ([], False)
+        self._trailer_policy.validate(
+            declared_fields=declared_fields,
+            headers=event.headers,
+            is_chunked=is_chunked,
+        )
+
     def send_with_data_passthrough(self, event: Event) -> Optional[List[bytes]]:
         """Identical to :meth:`send`, except that in situations where
         :meth:`send` returns a single :term:`bytes-like object`, this instead
@@ -554,6 +626,7 @@ class Connection:
         try:
             if type(event) is Response:
                 event = self._clean_up_response_headers_for_sending(event)
+            self._validate_outgoing_trailers(event)
             # We want to call _process_event before calling the writer,
             # because if someone tries to do something invalid then this will
             # give a sensible error message, while our writers all just assume

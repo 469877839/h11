@@ -29,6 +29,7 @@ from h11._state import (
     SERVER,
     SWITCHED_PROTOCOL,
 )
+from h11._trailers import TrailerPolicy
 from h11._util import LocalProtocolError, ProtocolError, RemoteProtocolError
 from h11._version import __version__
 
@@ -56,6 +57,7 @@ __all__ = (
     "SEND_RESPONSE",
     "SERVER",
     "SWITCHED_PROTOCOL",
+    "TrailerPolicy",
     "ProtocolError",
     "LocalProtocolError",
     "RemoteProtocolError",
