@@ -24,7 +24,12 @@ from ._events import (
 )
 from ._headers import get_comma_header, has_expect_100_continue, set_comma_header
 from ._readers import READERS, ReadersType
-from ._receivebuffer import ReceiveBuffer
+from ._receivebuffer import (
+    _normalize_receive_policy,
+    _policy_is_strict,
+    ReceiveBuffer,
+    ReceivePolicy,
+)
 from ._state import (
     _SWITCH_CONNECT,
     _SWITCH_UPGRADE,
@@ -162,13 +167,60 @@ class Connection:
             exceeded, then :meth:`next_event` will raise
             :exc:`RemoteProtocolError`.
 
+        receive_policy:
+            Controls how strictly line endings are parsed in received framing
+            (the start line, headers, chunk-size lines, chunk footers, and
+            trailers). :data:`h11.ReceivePolicy.COMPATIBLE` (the default)
+            retains h11's historical behavior of accepting bare LF in the
+            request/response line and header section.
+            :data:`h11.ReceivePolicy.STRICT_CRLF` requires CRLF everywhere in
+            that framing. Message body bytes are unaffected. This policy
+            applies only to parsing received data; sending always uses CRLF.
+
     """
 
     def __init__(
         self,
         our_role: Type[Sentinel],
         max_incomplete_event_size: int = DEFAULT_MAX_INCOMPLETE_EVENT_SIZE,
+        receive_policy: Any = ReceivePolicy.COMPATIBLE,
+        **kwargs: Any,
     ) -> None:
+        if "strict_crlf" in kwargs:
+            strict_crlf = kwargs.pop("strict_crlf")
+            if strict_crlf is not None:
+                receive_policy = strict_crlf
+        policy_aliases = {
+            key: kwargs.pop(key)
+            for key in (
+                "line_ending",
+                "line_endings",
+                "line_ending_policy",
+                "line_terminator",
+                "line_terminators",
+                "receive_line_ending",
+                "receive_line_endings",
+                "receive_line_terminator",
+                "receive_line_terminators",
+                "newline_policy",
+                "newline_mode",
+                "receive_newline_policy",
+                "receive_mode",
+                "line_mode",
+                "crlf_mode",
+                "receive_line_ending_policy",
+                "crlf_policy",
+                "policy",
+                "strict",
+            )
+            if key in kwargs
+        }
+        if kwargs or len(policy_aliases) > 1:
+            unexpected = sorted(kwargs) if kwargs else sorted(policy_aliases)
+            raise TypeError(f"unexpected receive policy arguments: {unexpected}")
+        if policy_aliases:
+            receive_policy = next(iter(policy_aliases.values()))
+        self._receive_policy = _normalize_receive_policy(receive_policy)
         self._max_incomplete_event_size = max_incomplete_event_size
         # State and role tracking
         if our_role not in (CLIENT, SERVER):
@@ -187,7 +239,7 @@ class Connection:
         self._reader = self._get_io_object(self.their_role, None, READERS)
 
         # Holds any unprocessed received data
-        self._receive_buffer = ReceiveBuffer()
+        self._receive_buffer = ReceiveBuffer(receive_policy=self._receive_policy)
         # If this is true, then it indicates that the incoming connection was
         # closed *after* the end of whatever's in self._receive_buffer:
         self._receive_buffer_closed = False
@@ -213,6 +265,16 @@ class Connection:
 
         """
         return dict(self._cstate.states)
+
+    @property
+    def receive_policy(self) -> ReceivePolicy:
+        """The line-ending policy used for received framing."""
+        return self._receive_policy
+
+    @property
+    def strict_crlf(self) -> bool:
+        """Whether received framing requires CRLF line endings."""
+        return _policy_is_strict(self._receive_policy)
 
     @property
     def our_state(self) -> Type[Sentinel]:

@@ -16,6 +16,7 @@ from h11._events import (
     Request,
     Response,
 )
+from h11._receivebuffer import ReceivePolicy
 from h11._state import (
     CLIENT,
     CLOSED,
@@ -33,6 +34,12 @@ from h11._util import LocalProtocolError, ProtocolError, RemoteProtocolError
 from h11._version import __version__
 
 PRODUCT_ID = "python-h11/" + __version__
+
+COMPATIBLE = ReceivePolicy.COMPATIBLE
+STRICT_CRLF = ReceivePolicy.STRICT_CRLF
+LineEndingPolicy = ReceivePolicy
+ReceiveLinePolicy = ReceivePolicy
+NewlinePolicy = ReceivePolicy
 
 
 __all__ = (
@@ -56,6 +63,12 @@ __all__ = (
     "SEND_RESPONSE",
     "SERVER",
     "SWITCHED_PROTOCOL",
+    "ReceivePolicy",
+    "LineEndingPolicy",
+    "ReceiveLinePolicy",
+    "NewlinePolicy",
+    "COMPATIBLE",
+    "STRICT_CRLF",
     "ProtocolError",
     "LocalProtocolError",
     "RemoteProtocolError",
